@@ -1,0 +1,31 @@
+{
+  "nav": {
+    "docs": "Documentation",
+    "generator": "Config Generator",
+    "dashboard": "Dashboard"
+  },
+  "home": {
+    "title": "LLM Performance Portal",
+    "subtitle": "Professional LLM API performance benchmarking tool. Accurately captures sub-millisecond latency, simulates real-world workloads, and provides Silicon Valley-level expert diagnosis.",
+    "start_testing": "Start Testing",
+    "view_docs": "View Documentation",
+    "features_title": "Core Features",
+    "feature_1_title": "Multi-Protocol Support",
+    "feature_1_desc": "Supports major LLM API protocols including OpenAI, Anthropic, Google, with easy custom interface extensions.",
+    "feature_2_title": "Core Metrics",
+    "feature_2_desc": "Sub-millisecond performance metrics: TTFT, TPS, ITL, TBT, QPS for comprehensive evaluation of model responsiveness and generation quality.",
+    "feature_3_title": "Expert Diagnosis",
+    "feature_3_desc": "Automated diagnostics based on Silicon Valley performance engineering standards to identify Prefill bottlenecks, KV Cache overflows, and other issues."
+  },
+  "generator": {
+    "load_mode": "Load Mode",
+    "end_concurrency": "Target Concurrency",
+    "step_size": "Step Size",
+    "provider": "Provider",
+    "model_name": "Model",
+    "start_concurrency": "Initial Concurrency",
+    "duration": "Duration",
+    "headers": "Headers",
+    "test_params": "Test Parameters"
+  }
+}

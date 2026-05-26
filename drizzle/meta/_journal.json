@@ -1,0 +1,48 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1778666341643,
+      "tag": "0000_true_richard_fisk",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1778724213531,
+      "tag": "0001_spotty_masked_marvel",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1778729055116,
+      "tag": "0002_sour_blizzard",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1778735068643,
+      "tag": "0003_rare_donald_blake",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1778826696078,
+      "tag": "0004_worried_ricochet",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1779090675914,
+      "tag": "0005_cuddly_captain_flint",
+      "breakpoints": true
+    }
+  ]
+}

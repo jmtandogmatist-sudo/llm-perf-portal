@@ -1,0 +1,31 @@
+{
+  "nav": {
+    "docs": "文档",
+    "generator": "配置生成器",
+    "dashboard": "结果看板"
+  },
+  "home": {
+    "title": "LLM 性能测试平台",
+    "subtitle": "专业级的大语言模型 API 性能基准测试工具。精确捕捉亚毫秒级延迟，模拟真实业务负载，提供硅谷级别的专家诊断。",
+    "start_testing": "开始测试",
+    "view_docs": "查看文档",
+    "features_title": "核心特性",
+    "feature_1_title": "多协议支持",
+    "feature_1_desc": "支持 OpenAI、Anthropic、Google 等主流 LLM API 协议，轻松扩展自定义接口",
+    "feature_2_title": "核心衡量指标",
+    "feature_2_desc": "亚毫秒级性能指标：TTFT、TPS、ITL、TBT、QPS，全面评估模型响应和生成质量",
+    "feature_3_title": "专家诊断",
+    "feature_3_desc": "基于硅谷性能工程标准的自动诊断，识别 Prefill 瓶颈、KV Cache 溢出等问题"
+  },
+  "generator": {
+    "load_mode": "负载模式",
+    "end_concurrency": "目标并发",
+    "step_size": "步长",
+    "provider": "供应商",
+    "model_name": "模型名称",
+    "start_concurrency": "初始并发",
+    "duration": "测试时长",
+    "headers": "附加请求头",
+    "test_params": "测试参数"
+  }
+}
