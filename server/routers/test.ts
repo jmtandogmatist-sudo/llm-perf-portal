@@ -4,6 +4,7 @@ import { getDb } from "../db";
 import { testConfigs, testResults, datasets, apiKeys, metricsTimeseries } from "../../drizzle/schema";
 import { pythonTestRunner } from "../services/pythonTestRunner";
 import { testExecutor } from "../services/testExecutor";
+import { taskQueueManager } from "../services/taskQueue";
 import { eq } from "drizzle-orm";
 import crypto from "crypto";
 
@@ -12,42 +13,32 @@ const encryptionKey =
   process.env.ENCRYPTION_KEY || "default-key-change-in-production";
 
 function encryptApiKey(apiKey: string): string {
-  try {
-    const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv(
-      "aes-256-cbc",
-      Buffer.from(encryptionKey.padEnd(32, "0").slice(0, 32)),
-      iv
-    );
-    let encrypted = cipher.update(apiKey, "utf8", "hex");
-    encrypted += cipher.final("hex");
-    return iv.toString("hex") + ":" + encrypted;
-  } catch (error) {
-    // Fallback to base64 if encryption fails
-    return Buffer.from(apiKey).toString("base64");
-  }
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(
+    "aes-256-cbc",
+    Buffer.from(encryptionKey.padEnd(32, "0").slice(0, 32)),
+    iv
+  );
+  let encrypted = cipher.update(apiKey, "utf8", "hex");
+  encrypted += cipher.final("hex");
+  return iv.toString("hex") + ":" + encrypted;
 }
 
 function decryptApiKey(encrypted: string): string {
-  try {
-    if (!encrypted.includes(":")) {
-      // Fallback for base64 encoded keys
-      return Buffer.from(encrypted, "base64").toString("utf8");
-    }
-    const [ivHex, encryptedHex] = encrypted.split(":");
-    const iv = Buffer.from(ivHex, "hex");
-    const decipher = crypto.createDecipheriv(
-      "aes-256-cbc",
-      Buffer.from(encryptionKey.padEnd(32, "0").slice(0, 32)),
-      iv
-    );
-    let decrypted = decipher.update(encryptedHex, "hex", "utf8");
-    decrypted += decipher.final("utf8");
-    return decrypted;
-  } catch (error) {
-    // Fallback to base64 if decryption fails
+  if (!encrypted.includes(":")) {
+    // Fallback for legacy base64 encoded keys
     return Buffer.from(encrypted, "base64").toString("utf8");
   }
+  const [ivHex, encryptedHex] = encrypted.split(":");
+  const iv = Buffer.from(ivHex, "hex");
+  const decipher = crypto.createDecipheriv(
+    "aes-256-cbc",
+    Buffer.from(encryptionKey.padEnd(32, "0").slice(0, 32)),
+    iv
+  );
+  let decrypted = decipher.update(encryptedHex, "hex", "utf8");
+  decrypted += decipher.final("utf8");
+  return decrypted;
 }
 
 const LoadConstantSchema = z.object({
@@ -328,55 +319,33 @@ export const testRouter = router({
         
         await db.update(testResults).set({ name: recordName }).where(eq(testResults.id, resultId));
 
-      try {
-        // Execute test
-        const result = await pythonTestRunner.executeTest({
-          apiProvider: input.apiProvider,
-          apiUrl: input.apiUrl,
-          apiKey: input.apiKey,
-          model: input.model,
-          concurrency: concurrencyFallback,
-          duration: durationFallback,
-          loadMode: input.loadMode,
-          loadConfig: input.loadConfig,
-          inputType: input.inputType,
-          inputData: input.inputData,
-        });
+      // Enqueue the task asynchronously using the TaskQueueManager
+      await taskQueueManager.enqueue(resultId, {
+        apiProvider: input.apiProvider,
+        apiUrl: input.apiUrl,
+        apiKey: input.apiKey,
+        model: input.model,
+        concurrency: concurrencyFallback,
+        duration: durationFallback,
+        loadMode: input.loadMode,
+        loadConfig: input.loadConfig,
+        inputType: input.inputType,
+        inputData: input.inputData,
+      });
 
-        // Update result record
-        await db
-          .update(testResults)
-          .set({
-            status: "completed",
-            totalRequests: result.totalRequests,
-            successfulRequests: result.successfulRequests,
-            successRate: normalizeMetricValue(result.successRate),
-            ttftAvg: normalizeMetricValue(result.ttftAvg),
-            ttftP95: normalizeMetricValue(result.ttftP95),
-            ttftP99: normalizeMetricValue(result.ttftP99),
-            tpsAvg: normalizeMetricValue(result.tpsAvg),
-            itlAvg: normalizeMetricValue(result.itlAvg),
-            qps: normalizeMetricValue(result.qps),
-            avgLatency: normalizeMetricValue(result.avgLatency),
-            p95Latency: normalizeMetricValue(result.p95Latency),
-          })
-          .where(eq(testResults.id, resultId));
+      return { resultId };
+    }),
 
-        return result;
-      } catch (error) {
-        // Update result record with error
-        const errorMessage =
-          error instanceof Error ? error.message : "Unknown error occurred";
-        await db
-          .update(testResults)
-          .set({
-            status: "failed",
-            errorMessage,
-          })
-          .where(eq(testResults.id, resultId));
-
-        throw new Error(`Test execution failed: ${errorMessage}`);
-      }
+  // Poll status of a running test
+  pollStatus: protectedProcedure
+    .input(
+      z.object({
+        resultId: z.number(),
+        fromLogIndex: z.number().default(0),
+      })
+    )
+    .query(async ({ input }) => {
+      return taskQueueManager.getJobStatus(input.resultId, input.fromLogIndex);
     }),
 
   // Get test results

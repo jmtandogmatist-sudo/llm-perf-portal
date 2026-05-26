@@ -54,6 +54,7 @@ export default function Generator() {
   // tRPC mutations
   const executeTestMutation = trpc.test.executeTest.useMutation();
   const checkApiHealthMutation = trpc.test.checkApiHealth.useMutation();
+  const utils = trpc.useUtils();
 
   // Auto-scroll logs to bottom
   useEffect(() => {
@@ -177,19 +178,8 @@ report:
     addLog("", "info");
 
     try {
-      // Simulate progress updates
-      const progressInterval = setInterval(() => {
-        setProgress(prev => {
-          if (prev >= 90) {
-            clearInterval(progressInterval);
-            return 90;
-          }
-          return prev + Math.random() * 10;
-        });
-      }, 500);
-
-      // Execute test
-      const result = await executeTestMutation.mutateAsync({
+      // Execute test mutation to get resultId (it no longer runs synchronously)
+      const enqueueResult = await executeTestMutation.mutateAsync({
         apiProvider: config.apiProvider,
         apiUrl: config.apiUrl,
         apiKey: config.apiKey,
@@ -200,49 +190,101 @@ report:
         inputData: normalizedInputData,
       });
 
-      clearInterval(progressInterval);
-      setProgress(100);
+      const resultId = enqueueResult.resultId;
+      addLog(`[System] Task queued successfully. Job ID: ${resultId}`, "info");
 
-      // Display results
-      addLog("", "info");
-      addLog("═══════════════════════════════════════", "info");
-      addLog("📊 TEST RESULTS SUMMARY", "info");
-      addLog("═══════════════════════════════════════", "info");
-      addLog(`Total Requests: ${result.totalRequests}`, "info");
+      let currentLogIndex = 0;
 
-      const successRateNum = result.successRate;
-      const isSuccess = result.successfulRequests > 0;
-      const isAllFailed = result.totalRequests > 0 && result.successfulRequests === 0;
+      await new Promise<void>((resolve, reject) => {
+        const pollInterval = setInterval(async () => {
+          try {
+            const statusResult = await utils.test.pollStatus.fetch({
+              resultId,
+              fromLogIndex: currentLogIndex,
+            });
 
-      addLog(
-        `Successful Requests: ${result.successfulRequests} (${result.successRate})`,
-        isAllFailed ? "error" : "success"
-      );
-      
-      if (isAllFailed) {
-         addLog(`❌ 所有请求均失败 (Failed: ${result.totalRequests - result.successfulRequests})`, "error");
-      }
+            // Append new logs
+            if (statusResult.logs && statusResult.logs.length > 0) {
+              statusResult.logs.forEach((logLine) => {
+                const isError = logLine.includes('❌') || logLine.includes('[ERROR]') || logLine.includes('failed:');
+                const isSuccess = logLine.includes('✅') || logLine.includes('completed successfully') || logLine.includes('completed');
+                const isWarning = logLine.includes('⚠️');
+                const level = isError ? 'error' : isSuccess ? 'success' : isWarning ? 'warning' : 'info';
+                
+                // Parse timestamp if present [HH:MM:SS] message
+                const timeMatch = logLine.match(/^\[(.*?)\]\s*(.*)$/);
+                if (timeMatch) {
+                  addLog(timeMatch[2], level);
+                } else {
+                  addLog(logLine, level);
+                }
+              });
+              currentLogIndex = statusResult.nextLogIndex;
+            }
 
-      addLog(`TTFT (Avg): ${result.ttftAvg}ms`, "info");
-      addLog(`TTFT (P95): ${result.ttftP95}ms`, "info");
-      addLog(`TTFT (P99): ${result.ttftP99}ms`, "info");
-      addLog(`TPS (Avg): ${result.tpsAvg} tokens/sec`, "info");
-      addLog(`ITL (Avg): ${result.itlAvg}ms`, "info");
-      addLog(`QPS: ${result.qps} requests/sec`, "info");
-      addLog("═══════════════════════════════════════", "info");
+            setProgress(statusResult.progress);
 
-      if (isAllFailed) {
-        addLog("⚠️ 测试运行完成，但业务请求全量异常！", "warning");
-        if (result.analysis && result.analysis.length > 0) {
-          result.analysis.forEach((msg: string) => addLog(`[专家诊断] ${msg}`, "error"));
-        }
-        toast.error("核心请求全部失败，请查看专家诊断");
-      } else {
-        addLog("✅ Test completed successfully!", "success");
-        toast.success("测试成功完成！");
-      }
+            if (statusResult.status === 'completed' && statusResult.result) {
+              clearInterval(pollInterval);
+              setProgress(100);
+              
+              const result = statusResult.result;
+              setTestResults(result);
 
-      setTestResults(result);
+              // Display results summary in logs
+              addLog("", "info");
+              addLog("═══════════════════════════════════════", "info");
+              addLog("📊 TEST RESULTS SUMMARY", "info");
+              addLog("═══════════════════════════════════════", "info");
+              addLog(`Total Requests: ${result.totalRequests}`, "info");
+
+              const isAllFailed = result.totalRequests > 0 && result.successfulRequests === 0;
+
+              addLog(
+                `Successful Requests: ${result.successfulRequests} (${result.successRate}%)`,
+                isAllFailed ? "error" : "success"
+              );
+              
+              if (isAllFailed) {
+                 addLog(`❌ 所有请求均失败 (Failed: ${result.totalRequests - result.successfulRequests})`, "error");
+              }
+
+              addLog(`TTFT (Avg): ${result.ttftAvg}ms`, "info");
+              addLog(`TTFT (P95): ${result.ttftP95}ms`, "info");
+              addLog(`TTFT (P99): ${result.ttftP99}ms`, "info");
+              addLog(`TPS (Avg): ${result.tpsAvg} tokens/sec`, "info");
+              addLog(`ITL (Avg): ${result.itlAvg}ms`, "info");
+              addLog(`QPS: ${result.qps} requests/sec`, "info");
+              addLog("═══════════════════════════════════════", "info");
+
+              if (isAllFailed) {
+                addLog("⚠️ 测试运行完成，但业务请求全量异常！", "warning");
+                if (result.analysis && result.analysis.length > 0) {
+                  result.analysis.forEach((msg: string) => addLog(`[专家诊断] ${msg}`, "error"));
+                }
+                toast.error("核心请求全部失败，请查看专家诊断");
+              } else {
+                addLog("✅ Test completed successfully!", "success");
+                toast.success("测试成功完成！");
+              }
+
+              // Refetch history panel list
+              utils.test.getResults.invalidate();
+              resolve();
+            } else if (statusResult.status === 'failed') {
+              clearInterval(pollInterval);
+              addLog(`❌ 测试运行失败: ${statusResult.error || '未知错误'}`, "error");
+              toast.error(`测试执行失败: ${statusResult.error || '未知错误'}`);
+              
+              // Refetch history panel list
+              utils.test.getResults.invalidate();
+              reject(new Error(statusResult.error));
+            }
+          } catch (e) {
+            console.error("Polling error:", e);
+          }
+        }, 1500);
+      });
     } catch (error) {
       addLog(
         `❌ 测试失败: ${error instanceof Error ? error.message : "未知错误"}`,
