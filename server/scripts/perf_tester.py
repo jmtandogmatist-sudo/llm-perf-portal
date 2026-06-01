@@ -9,7 +9,9 @@ from typing import List, Dict, Any
 class LLMPerfTester:
     def __init__(self, api_url: str, api_key: str, model: str, prompt: str, concurrency: int, duration: int):
         self.api_url = api_url
-        self.api_key = api_key
+        self.api_key = api_key.strip()
+        if self.api_key.startswith("Bearer "):
+            self.api_key = self.api_key[7:].strip()
         self.model = model
         self.prompt = prompt
         self.concurrency = concurrency

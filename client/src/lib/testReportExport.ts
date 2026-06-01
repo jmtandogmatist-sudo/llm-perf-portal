@@ -1,5 +1,12 @@
 import { jsPDF } from "jspdf";
 import {
+  loadChineseFont,
+  drawPageHeader,
+  drawPageFooter,
+  drawTable,
+  drawRiskBadge,
+} from "./pdfUtils";
+import {
   AlignmentType,
   BorderStyle,
   Document,
@@ -25,7 +32,7 @@ export interface ReportConfig {
   model: string;
   loadMode: LoadMode;
   loadConfig: Record<string, unknown>;
-  inputType: "text" | "image" | "json";
+  inputType: "text" | "image" | "json" | "video";
 }
 
 export interface ReportResults {
@@ -41,6 +48,7 @@ export interface ReportResults {
   avgLatency?: number | string;
   p95Latency?: number | string;
   analysis?: string[];
+  testType?: string;
 }
 
 interface ReportMetricSet {
@@ -63,6 +71,7 @@ export interface TestReportPayload {
   results: ReportMetricSet;
   analysis: string[];
   conclusion: string;
+  testType?: string;
 }
 
 type RiskLevel = "LOW" | "MEDIUM" | "HIGH";
@@ -90,12 +99,13 @@ const getRiskMeta = (payload: TestReportPayload) => {
       ? (payload.results.totalRequests - payload.results.successfulRequests) /
         payload.results.totalRequests
       : 0;
-  const p95 = payload.results.ttftP95;
+  const isRest = payload.testType === "REST_API";
+  const p95 = isRest ? payload.results.p95Latency : payload.results.ttftP95;
 
   let level: RiskLevel = "LOW";
-  if (failRate >= 0.05 || p95 >= 2000) {
+  if (failRate >= 0.05 || p95 >= (isRest ? 300 : 2000)) {
     level = "HIGH";
-  } else if (failRate >= 0.01 || p95 >= 1200) {
+  } else if (failRate >= 0.01 || p95 >= (isRest ? 150 : 1200)) {
     level = "MEDIUM";
   }
 
@@ -218,6 +228,7 @@ export const buildTestReportPayload = (
     },
     analysis,
     conclusion,
+    testType: rawResults.testType,
   };
 };
 
@@ -237,6 +248,14 @@ export const exportTestReportAsPdf = async (payload: TestReportPayload) => {
   }
 
   const pdf = new jsPDF("p", "mm", "a4");
+  
+  // Load and register Chinese font
+  try {
+    await loadChineseFont(pdf);
+  } catch (err) {
+    console.error("Failed to load Chinese font:", err);
+  }
+
   const pageWidth = pdf.internal.pageSize.getWidth();
   const pageHeight = pdf.internal.pageSize.getHeight();
   const left = 16;
@@ -244,50 +263,15 @@ export const exportTestReportAsPdf = async (payload: TestReportPayload) => {
   const contentWidth = pageWidth - left - right;
   let y = 22;
 
-  const drawPageHeader = (title: string) => {
-    pdf.setFillColor(245, 247, 250);
-    pdf.rect(0, 0, pageWidth, 14, "F");
-    if (logoDataUrl) {
-      pdf.addImage(logoDataUrl, "PNG", left, 2.7, 28, 8.2);
-    }
-    pdf.setFont("helvetica", "bold");
-    pdf.setFontSize(9);
-    pdf.setTextColor(31, 41, 55);
-    pdf.text(COMPANY_NAME, left + 31, 7.5);
-    pdf.setFont("helvetica", "normal");
-    pdf.setFontSize(8);
-    pdf.setTextColor(75, 85, 99);
-    pdf.text(title, pageWidth - right, 7.5, { align: "right" });
-    pdf.setDrawColor(229, 231, 235);
-    pdf.line(left, 14, pageWidth - right, 14);
-    pdf.setTextColor(0, 0, 0);
-  };
-
-  const drawPageFooter = () => {
-    const pageNum = pdf.getCurrentPageInfo().pageNumber;
-    pdf.setDrawColor(229, 231, 235);
-    pdf.line(left, pageHeight - 10, pageWidth - right, pageHeight - 10);
-    pdf.setFont("helvetica", "normal");
-    pdf.setFontSize(8);
-    pdf.setTextColor(107, 114, 128);
-    pdf.text("CONFIDENTIAL", left, pageHeight - 5.5);
-    pdf.text(`Page ${pageNum}`, pageWidth - right, pageHeight - 5.5, {
-      align: "right",
-    });
-    pdf.setTextColor(0, 0, 0);
-  };
-
   const ensurePage = (delta = 6) => {
-    if (y + delta <= pageHeight - 14) return;
-    drawPageFooter();
+    if (y + delta <= pageHeight - 16) return;
     pdf.addPage();
     y = 22;
-    drawPageHeader(REPORT_TITLE);
   };
 
   const addText = (text: string, size = 11, bold = false, gap = 6) => {
     ensurePage(gap);
-    pdf.setFont("helvetica", bold ? "bold" : "normal");
+    pdf.setFont("NotoSansSC", bold ? "bold" : "normal");
     pdf.setFontSize(size);
     const lines = pdf.splitTextToSize(text, contentWidth);
     pdf.text(lines, left, y);
@@ -301,124 +285,156 @@ export const exportTestReportAsPdf = async (payload: TestReportPayload) => {
     addText(title, 13, true, 7);
   };
 
-  // Cover
+  const isRest = payload.testType === "REST_API";
+  const dynamicReportTitle = isRest ? "API Performance Advisory Report" : REPORT_TITLE;
+
+  // PAGE 1: Cover Page
   pdf.setFillColor(17, 24, 39);
   pdf.rect(0, 0, pageWidth, 64, "F");
   if (logoDataUrl) {
     pdf.addImage(logoDataUrl, "PNG", left, 14, 42, 12);
   }
   pdf.setTextColor(255, 255, 255);
-  pdf.setFont("helvetica", "bold");
+  pdf.setFont("NotoSansSC", "bold");
   pdf.setFontSize(11);
   pdf.text(COMPANY_NAME, left, 34);
-  pdf.setFont("helvetica", "normal");
+  pdf.setFont("NotoSansSC", "normal");
   pdf.setFontSize(9);
   pdf.text(COMPANY_TAGLINE, left, 41);
-  pdf.setFont("helvetica", "bold");
+  pdf.setFont("NotoSansSC", "bold");
   pdf.setFontSize(22);
-  pdf.text(REPORT_TITLE, left, 55);
+  pdf.text(dynamicReportTitle, left, 55);
 
   pdf.setTextColor(17, 24, 39);
-  pdf.setFillColor(risk.color[0], risk.color[1], risk.color[2]);
-  pdf.roundedRect(left, 76, 52, 11, 2, 2, "F");
-  pdf.setTextColor(255, 255, 255);
-  pdf.setFontSize(10);
-  pdf.text(risk.label, left + 26, 83, { align: "center" });
+  drawRiskBadge(pdf, risk.label, risk.color, left, 76, 52, 11);
 
   pdf.setTextColor(17, 24, 39);
-  pdf.setFont("helvetica", "normal");
+  pdf.setFont("NotoSansSC", "normal");
   pdf.setFontSize(11);
-  pdf.text(`Generated At: ${payload.generatedAt}`, left, 98);
-  pdf.text(`Model: ${payload.config.model}`, left, 106);
-  pdf.text(`Provider: ${payload.config.apiProvider}`, left, 114);
-  pdf.text(`Summary: ${risk.summary}`, left, 122);
-  drawPageFooter();
+  pdf.text(`报告生成时间: ${payload.generatedAt}`, left, 98);
+  pdf.text(isRest ? `测试配置: ${payload.config.model || "默认配置"}` : `测试模型: ${payload.config.model}`, left, 106);
+  pdf.text(isRest ? `接口地址: ${payload.config.apiUrl}` : `接口服务商: ${payload.config.apiProvider}`, left, 114);
+  pdf.text(`评估简报: ${risk.summary}`, left, 122);
 
-  // TOC
+  // PAGE 2: Table of Contents
   pdf.addPage();
-  drawPageHeader(REPORT_TITLE);
   y = 24;
-  addText("Table of Contents", 16, true, 8);
-  addText("1. Executive Summary ........................................ 3", 11, false, 6);
-  addText("2. Risk Assessment .......................................... 3", 11, false, 6);
-  addText("3. Test Configuration ....................................... 4", 11, false, 6);
-  addText("4. Key Metrics .............................................. 4", 11, false, 6);
-  addText("5. Expert Analysis .......................................... 5", 11, false, 6);
-  drawPageFooter();
+  addText("报告目录 / Table of Contents", 16, true, 8);
+  addText("1. Executive Summary / 执行摘要 ..................................................... 3", 11, false, 8);
+  addText("2. Risk Assessment / 风险评估 ....................................................... 3", 11, false, 8);
+  addText("3. Test Configuration / 测试配置 .................................................... 4", 11, false, 8);
+  addText("4. Key Metrics / 性能关键指标 ....................................................... 4", 11, false, 8);
+  addText("5. Expert Analysis / 专家诊断与建议 ................................................. 5", 11, false, 8);
 
-  // Main body
+  // PAGE 3: Main body
   pdf.addPage();
-  drawPageHeader(REPORT_TITLE);
   y = 24;
 
-  addSectionTitle("1. Executive Summary");
+  addSectionTitle("1. Executive Summary / 执行摘要");
   addText(
-    `Success Rate: ${payload.results.successRate.toFixed(2)}% | QPS: ${payload.results.qps.toFixed(2)} | TTFT P95: ${payload.results.ttftP95.toFixed(2)} ms`,
+    isRest
+      ? `请求成功率: ${payload.results.successRate.toFixed(2)}% | 平均 QPS: ${payload.results.qps.toFixed(2)} | P95 响应延迟: ${payload.results.p95Latency.toFixed(2)} ms`
+      : `请求成功率: ${payload.results.successRate.toFixed(2)}% | 平均 QPS: ${payload.results.qps.toFixed(2)} | 首字延迟 P95 (TTFT P95): ${payload.results.ttftP95.toFixed(2)} ms`,
     10,
     false,
     6
   );
-  addText(`Conclusion: ${payload.conclusion}`, 10, false, 6);
+  addText(`诊断结论: ${payload.conclusion}`, 10, false, 6);
 
-  addSectionTitle("2. Risk Assessment");
+  addSectionTitle("2. Risk Assessment / 风险评估");
   ensurePage(12);
-  pdf.setFillColor(risk.color[0], risk.color[1], risk.color[2]);
-  pdf.roundedRect(left, y - 1, 44, 9, 2, 2, "F");
-  pdf.setFont("helvetica", "bold");
-  pdf.setFontSize(9);
-  pdf.setTextColor(255, 255, 255);
-  pdf.text(risk.label, left + 22, y + 5, { align: "center" });
+  drawRiskBadge(pdf, risk.label, risk.color, left, y - 1, 44, 9);
   pdf.setTextColor(17, 24, 39);
   y += 12;
   addText(risk.summary, 10, false, 6);
   addText(
-    `Failed Requests: ${Math.max(0, payload.results.totalRequests - payload.results.successfulRequests)} / ${payload.results.totalRequests}`,
+    `失败请求数 / 总请求数: ${Math.max(0, payload.results.totalRequests - payload.results.successfulRequests)} / ${payload.results.totalRequests}`,
     10,
     false,
     6
   );
 
-  addSectionTitle("3. Test Configuration");
-  addText(`Provider: ${payload.config.apiProvider}`, 10);
-  addText(`Endpoint: ${payload.config.apiUrl}`, 10);
-  addText(`Model: ${payload.config.model}`, 10);
-  addText(`Load Mode: ${payload.config.loadMode}`, 10);
-  addText(`Load Config: ${formatLoadConfig(payload.config.loadConfig)}`, 10);
-  addText(`Input Type: ${payload.config.inputType}`, 10, false, 6);
+  // PAGE 4: Test Configuration & Metrics
+  pdf.addPage();
+  y = 24;
 
-  addSectionTitle("4. Key Metrics");
-  addText(`Total Requests: ${payload.results.totalRequests}`, 10);
-  addText(`Successful Requests: ${payload.results.successfulRequests}`, 10);
-  addText(
-    `TTFT Avg / P95 / P99: ${payload.results.ttftAvg.toFixed(2)} / ${payload.results.ttftP95.toFixed(2)} / ${payload.results.ttftP99.toFixed(2)} ms`,
-    10
-  );
-  addText(`TPS Avg: ${payload.results.tpsAvg.toFixed(2)}`, 10);
-  addText(`ITL Avg: ${payload.results.itlAvg.toFixed(2)} ms`, 10);
-  addText(`QPS: ${payload.results.qps.toFixed(2)}`, 10);
-  addText(
-    `Avg Latency / P95 Latency: ${payload.results.avgLatency.toFixed(2)} / ${payload.results.p95Latency.toFixed(2)} ms`,
-    10,
-    false,
-    6
-  );
+  addSectionTitle("3. Test Configuration / 测试配置");
+  if (isRest) {
+    addText(`接口服务商 (Provider): ${payload.config.apiProvider}`, 10);
+    addText(`接口地址 (Endpoint): ${payload.config.apiUrl}`, 10);
+    addText(`配置名称 (Name): ${payload.config.model}`, 10);
+  } else {
+    addText(`接口服务商 (Provider): ${payload.config.apiProvider}`, 10);
+    addText(`接口地址 (Endpoint): ${payload.config.apiUrl}`, 10);
+    addText(`测试模型 (Model): ${payload.config.model}`, 10);
+  }
+  addText(`负载模式 (Load Mode): ${payload.config.loadMode}`, 10);
+  addText(`负载参数 (Load Config): ${formatLoadConfig(payload.config.loadConfig)}`, 10);
+  addText(`输入类型 (Input Type): ${payload.config.inputType}`, 10, false, 6);
 
-  addSectionTitle("5. Expert Analysis");
+  addSectionTitle("4. Key Metrics / 性能关键指标");
+  
+  const metricRows = isRest
+    ? [
+        ["总请求数 (Total Requests)", String(payload.results.totalRequests)],
+        ["成功请求数 (Successful Requests)", String(payload.results.successfulRequests)],
+        ["请求成功率 (Success Rate)", `${payload.results.successRate.toFixed(2)}%`],
+        ["每秒请求数 (QPS)", payload.results.qps.toFixed(2)],
+        ["平均响应时间 (Avg Latency)", `${payload.results.avgLatency.toFixed(2)} ms`],
+        ["响应时间 P95 (P95 Latency)", `${payload.results.p95Latency.toFixed(2)} ms`],
+      ]
+    : [
+        ["总请求数 (Total Requests)", String(payload.results.totalRequests)],
+        ["成功请求数 (Successful Requests)", String(payload.results.successfulRequests)],
+        ["请求成功率 (Success Rate)", `${payload.results.successRate.toFixed(2)}%`],
+        ["首字延迟平均值 (TTFT Avg)", `${payload.results.ttftAvg.toFixed(2)} ms`],
+        ["首字延迟 P95 (TTFT P95)", `${payload.results.ttftP95.toFixed(2)} ms`],
+        ["首字延迟 P99 (TTFT P99)", `${payload.results.ttftP99.toFixed(2)} ms`],
+        ["每秒生成 Token 数 (TPS Avg)", payload.results.tpsAvg.toFixed(2)],
+        ["词间延迟平均值 (ITL Avg)", `${payload.results.itlAvg.toFixed(2)} ms`],
+        ["每秒请求数 (QPS)", payload.results.qps.toFixed(2)],
+        ["平均响应时间 (Avg Latency)", `${payload.results.avgLatency.toFixed(2)} ms`],
+        ["响应时间 P95 (P95 Latency)", `${payload.results.p95Latency.toFixed(2)} ms`],
+      ];
+
+  y = drawTable(pdf, ["性能指标 (Performance Metric)", "测量值 (Measured Value)"], metricRows, {
+    startY: y + 2,
+    colWidths: [118, 60],
+    alignments: ["left", "right"],
+    fontSize: 9,
+  });
+
+  // PAGE 5: Expert Analysis
+  pdf.addPage();
+  y = 24;
+
+  addSectionTitle("5. Expert Analysis & Recommendations / 专家诊断与调优建议");
   if (payload.analysis.length === 0) {
-    addText("No expert analysis generated.", 10);
+    addText("暂无专家性能诊断建议。", 10);
   } else {
     payload.analysis.forEach((item, idx) => {
-      addText(`${idx + 1}. ${item}`, 10);
+      addText(`${idx + 1}. ${item}`, 10, false, 8);
     });
   }
 
-  drawPageFooter();
+  // Draw headers & footers on all pages at the very end
+  const totalPages = pdf.getNumberOfPages();
+  for (let i = 1; i <= totalPages; i++) {
+    pdf.setPage(i);
+    if (i > 1) {
+      drawPageHeader(pdf, dynamicReportTitle, logoDataUrl, COMPANY_NAME, pageWidth, left, right);
+    }
+    drawPageFooter(pdf, i, totalPages, pageHeight, pageWidth, left, right);
+  }
 
-  pdf.save(createFileName("llm-advisory-report", "pdf"));
+  pdf.save(createFileName(isRest ? "api-advisory-report" : "llm-advisory-report", "pdf"));
 };
 
 export const exportTestReportAsWord = async (payload: TestReportPayload) => {
   const risk = getRiskMeta(payload);
+  const isRest = payload.testType === "REST_API";
+  const dynamicReportTitle = isRest ? "API Performance Advisory Report" : REPORT_TITLE;
+
   let logoData: Uint8Array | null = null;
   try {
     const logoDataUrl = await loadLogoPngDataUrl(440, 120);
@@ -427,19 +443,28 @@ export const exportTestReportAsWord = async (payload: TestReportPayload) => {
     logoData = null;
   }
 
-  const rows = [
-    ["Total Requests", String(payload.results.totalRequests)],
-    ["Successful Requests", String(payload.results.successfulRequests)],
-    ["Success Rate", `${payload.results.successRate.toFixed(2)}%`],
-    ["TTFT Avg", `${payload.results.ttftAvg.toFixed(2)} ms`],
-    ["TTFT P95", `${payload.results.ttftP95.toFixed(2)} ms`],
-    ["TTFT P99", `${payload.results.ttftP99.toFixed(2)} ms`],
-    ["TPS Avg", payload.results.tpsAvg.toFixed(2)],
-    ["ITL Avg", `${payload.results.itlAvg.toFixed(2)} ms`],
-    ["QPS", payload.results.qps.toFixed(2)],
-    ["Avg Latency", `${payload.results.avgLatency.toFixed(2)} ms`],
-    ["P95 Latency", `${payload.results.p95Latency.toFixed(2)} ms`],
-  ];
+  const rows = isRest
+    ? [
+        ["Total Requests", String(payload.results.totalRequests)],
+        ["Successful Requests", String(payload.results.successfulRequests)],
+        ["Success Rate", `${payload.results.successRate.toFixed(2)}%`],
+        ["QPS", payload.results.qps.toFixed(2)],
+        ["Avg Latency", `${payload.results.avgLatency.toFixed(2)} ms`],
+        ["P95 Latency", `${payload.results.p95Latency.toFixed(2)} ms`],
+      ]
+    : [
+        ["Total Requests", String(payload.results.totalRequests)],
+        ["Successful Requests", String(payload.results.successfulRequests)],
+        ["Success Rate", `${payload.results.successRate.toFixed(2)}%`],
+        ["TTFT Avg", `${payload.results.ttftAvg.toFixed(2)} ms`],
+        ["TTFT P95", `${payload.results.ttftP95.toFixed(2)} ms`],
+        ["TTFT P99", `${payload.results.ttftP99.toFixed(2)} ms`],
+        ["TPS Avg", payload.results.tpsAvg.toFixed(2)],
+        ["ITL Avg", `${payload.results.itlAvg.toFixed(2)} ms`],
+        ["QPS", payload.results.qps.toFixed(2)],
+        ["Avg Latency", `${payload.results.avgLatency.toFixed(2)} ms`],
+        ["P95 Latency", `${payload.results.p95Latency.toFixed(2)} ms`],
+      ];
 
   const tableRows = [
     new TableRow({
@@ -543,7 +568,7 @@ export const exportTestReportAsWord = async (payload: TestReportPayload) => {
           }),
           new Paragraph(""),
           new Paragraph({
-            text: REPORT_TITLE,
+            text: dynamicReportTitle,
             heading: HeadingLevel.HEADING_1,
             alignment: AlignmentType.CENTER,
           }),
@@ -553,7 +578,7 @@ export const exportTestReportAsWord = async (payload: TestReportPayload) => {
           }),
           new Paragraph({
             alignment: AlignmentType.CENTER,
-            children: [new TextRun(`Model: ${payload.config.model}`)],
+            children: [new TextRun(isRest ? `Config: ${payload.config.model || "Default"}` : `Model: ${payload.config.model}`)],
           }),
           new Paragraph(""),
           new Paragraph(""),
@@ -583,7 +608,9 @@ export const exportTestReportAsWord = async (payload: TestReportPayload) => {
             heading: HeadingLevel.HEADING_1,
           }),
           new Paragraph(
-            `Success Rate: ${payload.results.successRate.toFixed(2)}% | QPS: ${payload.results.qps.toFixed(2)} | TTFT P95: ${payload.results.ttftP95.toFixed(2)} ms`
+            isRest
+              ? `Success Rate: ${payload.results.successRate.toFixed(2)}% | QPS: ${payload.results.qps.toFixed(2)} | P95 Latency: ${payload.results.p95Latency.toFixed(2)} ms`
+              : `Success Rate: ${payload.results.successRate.toFixed(2)}% | QPS: ${payload.results.qps.toFixed(2)} | TTFT P95: ${payload.results.ttftP95.toFixed(2)} ms`
           ),
           new Paragraph(`Conclusion: ${payload.conclusion}`),
           new Paragraph(""),
@@ -599,7 +626,7 @@ export const exportTestReportAsWord = async (payload: TestReportPayload) => {
           }),
           new Paragraph(`Provider: ${payload.config.apiProvider}`),
           new Paragraph(`Endpoint: ${payload.config.apiUrl}`),
-          new Paragraph(`Model: ${payload.config.model}`),
+          new Paragraph(isRest ? `Config: ${payload.config.model || "Default"}` : `Model: ${payload.config.model}`),
           new Paragraph(`Load Mode: ${payload.config.loadMode}`),
           new Paragraph(`Load Config: ${formatLoadConfig(payload.config.loadConfig)}`),
           new Paragraph(`Input Type: ${payload.config.inputType}`),
@@ -656,5 +683,5 @@ export const exportTestReportAsWord = async (payload: TestReportPayload) => {
   });
 
   const blob = await Packer.toBlob(doc);
-  downloadBlob(blob, createFileName("llm-advisory-report", "docx"));
+  downloadBlob(blob, createFileName(isRest ? "api-advisory-report" : "llm-advisory-report", "docx"));
 };

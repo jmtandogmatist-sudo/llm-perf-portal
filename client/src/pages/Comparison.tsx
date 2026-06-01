@@ -21,24 +21,29 @@ export default function Comparison() {
   }, []);
 
   const { data: testResults = [], isLoading } = trpc.test.getResults.useQuery();
+  const { data: environments = [] } = trpc.environment.getEnvironments.useQuery();
 
-  const { comparisonData, modelStats, radarData } = useMemo(() => {
+  const { comparisonData, modelStats, radarData, isRestApiOnly } = useMemo(() => {
     if (!testResults || selectedIds.length === 0) {
-      return { comparisonData: [], modelStats: [], radarData: [] };
+      return { comparisonData: [], modelStats: [], radarData: [], isRestApiOnly: false };
     }
 
     const selectedResults = testResults.filter((r: any) => selectedIds.includes(r.id) && r.status === 'completed');
 
-    if (selectedResults.length === 0) return { comparisonData: [], modelStats: [], radarData: [] };
+    if (selectedResults.length === 0) return { comparisonData: [], modelStats: [], radarData: [], isRestApiOnly: false };
+
+    const isRest = selectedResults.every((r: any) => r.testType === 'REST_API');
 
     // Format results to mapping object for charts
-    const ttftData: any = { metric: 'TTFT (ms)' };
-    const tpsData: any = { metric: 'TPS' };
-    const qpsData: any = { metric: 'QPS' };
-    const p95Data: any = { metric: 'P95 TTFT (ms)' };
+    const metric1Data: any = { metric: isRest ? 'Avg Latency (ms)' : 'TTFT (ms)' };
+    const metric2Data: any = { metric: isRest ? 'Avg Size (KB)' : 'TPS' };
+    const metric3Data: any = { metric: 'QPS' };
+    const metric4Data: any = { metric: isRest ? 'P95 Latency (ms)' : 'P95 TTFT (ms)' };
 
     const stats: any[] = [];
-    const radarFeatures = ['TTFT 响应', 'TPS 吞吐', 'QPS 大小', 'P95 稳定', '并发量'];
+    const radarFeatures = isRest 
+      ? ['QPS 吞吐', '平均延迟', 'P95 延迟', '平均大小', '并发量']
+      : ['TTFT 响应', 'TPS 吞吐', 'QPS 大小', 'P95 稳定', '并发量'];
     const rData = radarFeatures.map((feat: string) => ({ subject: feat } as any));
 
     selectedResults.forEach((res: any, idx: number) => {
@@ -51,37 +56,73 @@ export default function Comparison() {
       const p95 = parseInt(typeof res.ttftP95 === 'string' ? res.ttftP95.replace('ms', '') : res.ttftP95 || '0');
       const concurrency = res.concurrency || res.config?.concurrency || 1;
 
-      ttftData[uniqueName] = ttft;
-      tpsData[uniqueName] = tps;
-      qpsData[uniqueName] = qps;
-      p95Data[uniqueName] = p95;
+      const avgLatency = parseFloat(res.avgLatency || res.latencyAvg || '0');
+      const p95Latency = parseFloat(res.p95Latency || res.latencyP95 || '0');
+
+      const protocolMetrics = res.protocolMetrics as { statusCodes?: Record<string, number>; avgResponseSize?: number } | null;
+      const avgResponseSizeVal = protocolMetrics?.avgResponseSize || 0;
+      const avgResponseSizeInKb = parseFloat((avgResponseSizeVal / 1024).toFixed(2));
+      const avgResponseSizeFormatted = avgResponseSizeVal > 1024 
+        ? `${avgResponseSizeInKb} KB` 
+        : `${avgResponseSizeVal} Bytes`;
+
+      if (isRest) {
+        metric1Data[uniqueName] = avgLatency;
+        metric2Data[uniqueName] = avgResponseSizeInKb;
+        metric3Data[uniqueName] = qps;
+        metric4Data[uniqueName] = p95Latency;
+      } else {
+        metric1Data[uniqueName] = ttft;
+        metric2Data[uniqueName] = tps;
+        metric3Data[uniqueName] = qps;
+        metric4Data[uniqueName] = p95;
+      }
+
+      const env = environments.find((e: any) => e.id === res.environmentId);
+      const envName = env ? env.name : '线上/默认 API';
+      const envSpecs = env ? `${env.gpuCount ? `${env.gpuCount}x ` : ''}${env.gpuModel || 'NVIDIA'} | ${env.inferenceEngine || 'vLLM'} | ${env.quantization || 'None'}` : '无/默认 API';
 
       stats.push({
         id: res.id,
         name: uniqueName,
         model: modelName,
-        ttft: res.ttftAvg,
-        tps: `${tps.toFixed(2)} tok/s`,
+        isRest,
+        ttft: isRest ? undefined : res.ttftAvg,
+        tps: isRest ? undefined : `${tps.toFixed(2)} tok/s`,
         qps: `${qps.toFixed(2)} req/s`,
-        p95: res.ttftP95,
+        p95: isRest ? undefined : res.ttftP95,
+        avgLatency: isRest ? `${avgLatency.toFixed(2)} ms` : undefined,
+        p95Latency: isRest ? `${p95Latency.toFixed(2)} ms` : undefined,
+        avgResponseSize: isRest ? avgResponseSizeFormatted : undefined,
         cost: '参考API定价',
         date: new Date(res.createdAt).toLocaleString(),
         verdict: '真实压测数据',
+        envName,
+        envSpecs,
       });
 
-      rData[0][uniqueName] = Math.max(0, 100 - (ttft / 50)); 
-      rData[1][uniqueName] = Math.min(100, tps * 2); 
-      rData[2][uniqueName] = Math.min(100, qps * 5); 
-      rData[3][uniqueName] = Math.max(0, 100 - (p95 / 80)); 
-      rData[4][uniqueName] = Math.min(100, concurrency * 5); 
+      if (isRest) {
+        rData[0][uniqueName] = Math.max(0, 100 - (avgLatency / 10)); 
+        rData[1][uniqueName] = Math.max(0, 100 - (avgResponseSizeInKb / 5)); 
+        rData[2][uniqueName] = Math.min(100, qps * 5); 
+        rData[3][uniqueName] = Math.max(0, 100 - (p95Latency / 15)); 
+        rData[4][uniqueName] = Math.min(100, concurrency * 5); 
+      } else {
+        rData[0][uniqueName] = Math.max(0, 100 - (ttft / 50)); 
+        rData[1][uniqueName] = Math.min(100, tps * 2); 
+        rData[2][uniqueName] = Math.min(100, qps * 5); 
+        rData[3][uniqueName] = Math.max(0, 100 - (p95 / 80)); 
+        rData[4][uniqueName] = Math.min(100, concurrency * 5); 
+      }
     });
 
     return { 
-      comparisonData: [ttftData, tpsData, qpsData, p95Data], 
+      comparisonData: [metric1Data, metric2Data, metric3Data, metric4Data], 
       modelStats: stats,
-      radarData: rData
+      radarData: rData,
+      isRestApiOnly: isRest
     };
-  }, [selectedIds, testResults]);
+  }, [selectedIds, testResults, environments]);
 
   const colors = ['#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6', '#f59e0b'];
 
@@ -175,20 +216,43 @@ export default function Comparison() {
                     <p className="text-sm text-muted-foreground mb-4">测试时间: {model.date}</p>
                     <div className="space-y-3 mb-6">
                       <div className="flex justify-between items-center bg-muted/20 p-2 rounded">
-                        <span className="text-muted-foreground">TTFT</span>
-                        <span className="font-semibold">{model.ttft}</span>
+                        <span className="text-muted-foreground text-xs">被测环境 (SUT)</span>
+                        <span className="font-semibold text-xs text-right truncate max-w-[180px]" title={model.envSpecs}>{model.envName}</span>
                       </div>
                       <div className="flex justify-between items-center p-2 rounded">
-                        <span className="text-muted-foreground">TPS</span>
-                        <span className="font-semibold">{model.tps}</span>
+                        <span className="text-muted-foreground text-xs">环境规格配置</span>
+                        <span className="text-2xs text-muted-foreground/80 text-right truncate max-w-[180px]" title={model.envSpecs}>{model.envSpecs}</span>
                       </div>
+                      {!model.isRest ? (
+                        <>
+                          <div className="flex justify-between items-center bg-muted/20 p-2 rounded">
+                            <span className="text-muted-foreground">TTFT</span>
+                            <span className="font-semibold">{model.ttft}</span>
+                          </div>
+                          <div className="flex justify-between items-center p-2 rounded">
+                            <span className="text-muted-foreground">TPS</span>
+                            <span className="font-semibold">{model.tps}</span>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="flex justify-between items-center bg-muted/20 p-2 rounded">
+                            <span className="text-muted-foreground">平均响应延迟</span>
+                            <span className="font-semibold">{model.avgLatency}</span>
+                          </div>
+                          <div className="flex justify-between items-center p-2 rounded">
+                            <span className="text-muted-foreground">平均响应大小</span>
+                            <span className="font-semibold">{model.avgResponseSize}</span>
+                          </div>
+                        </>
+                      )}
                       <div className="flex justify-between items-center bg-muted/20 p-2 rounded">
                         <span className="text-muted-foreground">QPS</span>
                         <span className="font-semibold">{model.qps}</span>
                       </div>
                       <div className="flex justify-between items-center p-2 rounded">
-                        <span className="text-muted-foreground">P95 TTFT</span>
-                        <span className="font-semibold">{model.p95}</span>
+                        <span className="text-muted-foreground">{model.isRest ? 'P95 响应延迟' : 'P95 TTFT'}</span>
+                        <span className="font-semibold">{model.isRest ? model.p95Latency : model.p95}</span>
                       </div>
                     </div>
                     <div className="pt-4 border-t border-border flex justify-between items-center">

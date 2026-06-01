@@ -8,177 +8,81 @@ import os
 import yaml
 from typing import List, Dict, Any
 
-class LLMPerfPlatform:
+from protocols.protocol_interface import BaseProtocolExecutor
+from protocols.llm_protocol import LlmProtocolExecutor
+from protocols.http_protocol import HttpProtocolExecutor
+
+class MultiProtocolPerfPlatform:
     """
-    LLM 性能测试平台核心类 (V3 - 重构版)
-    支持真实 Token 计数评估、多负载并发模式动态调度。
+    多协议性能测试平台核心类
+    统一管理并发 Workers、自适应负载调度和遥测输出，协议的具体发送交由插件执行。
     """
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.api_config = config.get('api', {})
         self.test_config = config.get('test', {})
         self.report_config = config.get('report', {})
         
+        # 解析测试类型 (默认为 LLM 以兼容老版本)
+        self.test_type = config.get('test_type', 'LLM')
+        
+        # 组装协议配置
+        if self.test_type == 'LLM':
+            if 'api' in config:
+                # 兼容老版 YAML 配置
+                self.protocol_config = {
+                    "url": config['api'].get('url', ''),
+                    "key": config['api'].get('key', ''),
+                    "model": config['api'].get('model', ''),
+                    "provider": config['api'].get('provider', ''),
+                    "stream": self.test_config.get('stream', True),
+                    "input_type": self.test_config.get('input', {}).get('type', 'text'),
+                    "input_data": self.test_config.get('input', {}).get('data', ''),
+                }
+            else:
+                self.protocol_config = config.get('protocol_config', {})
+            self.executor = LlmProtocolExecutor(self.protocol_config)
+        elif self.test_type == 'REST_API':
+            self.protocol_config = config.get('protocol_config', {})
+            self.executor = HttpProtocolExecutor(self.protocol_config)
+        else:
+            raise ValueError(f"Unsupported test type: {self.test_type}")
+            
         self.results = []
         self.start_time = 0
         self.total_time = 0
         self.should_stop = False
         self.active_tasks = []
+        self.target_concurrency = 0
+        self.running_workers = 0
 
-    def estimate_tokens_heuristic(self, text: str) -> int:
-        """
-        启发式 Token 计数器：针对未返回 native usage 的供应商计算近似 Token
-        中文字符估算为 1.5 token，英文单词估算为 1.3 token，符号为空白字符估算为 0.3 token
-        """
-        if not text:
-            return 0
-        chinese_chars = 0
-        other_chars = 0
-        for char in text:
-            if '\u4e00' <= char <= '\u9fff':
-                chinese_chars += 1
-            else:
-                other_chars += 1
-        
-        words = len(text.split())
-        symbols_and_spaces = max(0, other_chars - words)
-        estimated = int(chinese_chars * 1.5 + words * 1.3 + symbols_and_spaces * 0.3)
-        return max(1, estimated)
-
-    def prepare_payload(self) -> Dict[str, Any]:
-        """根据配置准备请求 Payload"""
-        input_type = self.test_config.get('input', {}).get('type', 'text')
-        input_data = self.test_config.get('input', {}).get('data', '')
-        model = self.api_config.get('model', '')
-        stream = self.test_config.get('stream', True)
-
-        payload = {"model": model, "stream": stream}
-
-        if stream:
-            # 向 OpenAI 类接口申请返回 stream 状态下的 usage 指标
-            payload["stream_options"] = {"include_usage": True}
-
-        if input_type == 'text':
-            payload["messages"] = [{"role": "user", "content": input_data}]
-        elif input_type == 'image':
-            payload["messages"] = [{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": input_data}},
-                    {"type": "text", "text": "Describe this image."}
-                ]
-            }]
-        elif input_type == 'json':
-            if os.path.exists(input_data):
-                with open(input_data, 'r') as f:
-                    payload = json.load(f)
-            else:
-                payload = json.loads(input_data)
-        
-        return payload
-
-    async def make_request(self, session: aiohttp.ClientSession, payload: Dict[str, Any]):
-        """发起单个请求并收集深度指标"""
-        headers = {
-            "Authorization": f"Bearer {self.api_config.get('key', '')}",
-            "Content-Type": "application/json"
-        }
-        
-        request_start = time.perf_counter()
-        ttft = None
-        token_timestamps = []
-        total_tokens = 0
-        success = False
-        error_msg = ""
-        accumulated_content = ""
-
-        try:
-            async with session.post(self.api_config.get('url', ''), headers=headers, json=payload, timeout=300) as response:
-                if response.status != 200:
-                    error_msg = f"Status {response.status}: {await response.text()}"
-                else:
-                    if self.test_config.get('stream', True):
-                        async for line in response.content:
-                            line = line.decode('utf-8').strip()
-                            if not line or line == "data: [DONE]": continue
-                            if line.startswith("data: "):
-                                current_time = time.perf_counter()
-                                if ttft is None:
-                                    ttft = (current_time - request_start) * 1000
-                                token_timestamps.append(current_time)
-                                
-                                # 解析流数据，累加内容或提取官方 token 计数
-                                try:
-                                    chunk_data = json.loads(line[6:])
-                                    # 1. 尝试从 stream_options 提取官方统计
-                                    if "usage" in chunk_data and chunk_data["usage"]:
-                                        usage_tokens = chunk_data["usage"].get("completion_tokens", 0)
-                                        if usage_tokens > 0:
-                                            total_tokens = usage_tokens
-                                    
-                                    # 2. 累加文字内容用于 fallback 启发式估算
-                                    if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
-                                        delta = chunk_data["choices"][0].get("delta", {})
-                                        content = delta.get("content", "")
-                                        if content:
-                                            accumulated_content += content
-                                except:
-                                    pass
-                        
-                        # Fallback 估算 Token
-                        if total_tokens == 0 and accumulated_content:
-                            total_tokens = self.estimate_tokens_heuristic(accumulated_content)
-                        elif total_tokens == 0:
-                            # 终极 Fallback (按 chunk 估算)
-                            total_tokens = len(token_timestamps)
-
-                        success = True
-                    else:
-                        data = await response.json()
-                        total_tokens = data.get("usage", {}).get("completion_tokens", 0)
-                        if total_tokens == 0:
-                            # 如果非流式接口没有返回 usage，估算它的 choices content
-                            try:
-                                choices_text = data["choices"][0]["message"]["content"]
-                                total_tokens = self.estimate_tokens_heuristic(choices_text)
-                            except:
-                                pass
-                        ttft = (time.perf_counter() - request_start) * 1000
-                        success = True
-        except Exception as e:
-            error_msg = str(e)
-
-        total_latency = (time.perf_counter() - request_start) * 1000
-        
-        # 计算 ITL (Inter-Token Latency)
-        itls = []
-        if len(token_timestamps) > 1:
-            itls = [(token_timestamps[i] - token_timestamps[i-1]) * 1000 for i in range(1, len(token_timestamps))]
-        
-        return {
-            "success": success,
-            "error": error_msg,
-            "ttft": ttft,
-            "total_latency": total_latency,
-            "tokens": total_tokens,
-            "itls": itls,
-            "timestamp": time.time()
-        }
-
-    async def worker_loop(self, payload: Dict[str, Any]):
+    async def worker_loop(self, payload: Any):
         """工作协程的请求内循环"""
-        async with aiohttp.ClientSession() as session:
-            while not self.should_stop:
-                result = await self.make_request(session, payload)
-                self.results.append(result)
-                await asyncio.sleep(0.1) # 避免本地物理循环瞬间占满并发
+        self.running_workers += 1
+        try:
+            async with aiohttp.ClientSession() as session:
+                while not self.should_stop:
+                    # 检查是否需要收缩并发
+                    if self.running_workers > self.target_concurrency:
+                        break
+                    result = await self.executor.make_request(session, payload)
+                    # 将时间戳附在结果上用于遥测统计
+                    result["timestamp"] = time.time()
+                    
+                    self.results.append(result)
+                    
+                    if self.running_workers > self.target_concurrency:
+                        break
+                    await asyncio.sleep(0.1) # 避免本地物理循环瞬间占满并发
+        finally:
+            self.running_workers -= 1
 
-    async def adjust_concurrency_loop(self, load_mode: str, load_config: Dict[str, Any], payload: Dict[str, Any]):
+    async def adjust_concurrency_loop(self, load_mode: str, load_config: Dict[str, Any], payload: Any):
         """
         负载模式核心管理器：动态调整并发 Workers 协程数
         """
         if load_mode == 'constant':
             concurrency = load_config.get('concurrency', 1)
+            self.target_concurrency = concurrency
             print(f"[{time.strftime('%H:%M:%S')}] [Constant] Spawning {concurrency} static workers.")
             for _ in range(concurrency):
                 self.active_tasks.append(asyncio.create_task(self.worker_loop(payload)))
@@ -194,6 +98,7 @@ class LLMPerfPlatform:
             step_interval = duration / num_steps
             
             current_concurrency = start
+            self.target_concurrency = current_concurrency
             print(f"[{time.strftime('%H:%M:%S')}] [Ramp-up] Starting with {current_concurrency} workers.")
             for _ in range(current_concurrency):
                 self.active_tasks.append(asyncio.create_task(self.worker_loop(payload)))
@@ -203,9 +108,10 @@ class LLMPerfPlatform:
                 if self.should_stop:
                     break
                 to_add = min(step, end - current_concurrency)
+                current_concurrency += to_add
+                self.target_concurrency = current_concurrency
                 for _ in range(to_add):
                     self.active_tasks.append(asyncio.create_task(self.worker_loop(payload)))
-                current_concurrency += to_add
                 print(f"[{time.strftime('%H:%M:%S')}] [Ramp-up] Scaled up to {current_concurrency} workers.")
 
         elif load_mode == 'fluctuate':
@@ -220,6 +126,8 @@ class LLMPerfPlatform:
                 target = int(min_c + (max_c - min_c) * (sine_val + 1) / 2)
                 target = max(1, target)
                 
+                self.target_concurrency = target
+                
                 # 动态伸缩 active tasks
                 live_tasks = [t for t in self.active_tasks if not t.done()]
                 current_count = len(live_tasks)
@@ -227,11 +135,8 @@ class LLMPerfPlatform:
                 if current_count < target:
                     for _ in range(target - current_count):
                         self.active_tasks.append(asyncio.create_task(self.worker_loop(payload)))
-                elif current_count > target:
-                    for i in range(current_count - target):
-                        live_tasks[i].cancel()
                 
-                print(f"[{time.strftime('%H:%M:%S')}] [Fluctuate] Elapsed: {elapsed:.1f}s | Target Concurrency: {target}")
+                print(f"[{time.strftime('%H:%M:%S')}] [Fluctuate] Elapsed: {elapsed:.1f}s | Target Concurrency: {target} | Active: {current_count}")
                 await asyncio.sleep(2)
 
         elif load_mode == 'spike':
@@ -239,6 +144,7 @@ class LLMPerfPlatform:
             spike = load_config.get('spike', 10)
             spike_duration = load_config.get('spike_duration', 10)
             
+            self.target_concurrency = baseline
             print(f"[{time.strftime('%H:%M:%S')}] [Spike] Baseline concurrency {baseline}. Spike target {spike} for {spike_duration}s.")
             for _ in range(baseline):
                 self.active_tasks.append(asyncio.create_task(self.worker_loop(payload)))
@@ -249,26 +155,61 @@ class LLMPerfPlatform:
                 return
                 
             print(f"[{time.strftime('%H:%M:%S')}] [Spike] !!! SPIKE TRIGGERED !!! Concurrency spikes to {spike}.")
-            spike_tasks = []
+            self.target_concurrency = spike
             for _ in range(spike - baseline):
-                t = asyncio.create_task(self.worker_loop(payload))
-                self.active_tasks.append(t)
-                spike_tasks.append(t)
+                self.active_tasks.append(asyncio.create_task(self.worker_loop(payload)))
                 
             await asyncio.sleep(spike_duration)
             if self.should_stop:
                 return
                 
             print(f"[{time.strftime('%H:%M:%S')}] [Spike] Spike ended. Restoring back to baseline concurrency: {baseline}.")
-            for t in spike_tasks:
-                if not t.done():
-                    t.cancel()
+            self.target_concurrency = baseline
+
+    async def report_telemetry_loop(self):
+        """每秒输出一次瞬时/累计遥测数据"""
+        first_error_logged = False
+        while not self.should_stop:
+            await asyncio.sleep(1.0)
+            if self.should_stop:
+                break
+            elapsed = time.perf_counter() - self.start_time
+            successful = [r for r in self.results if r["success"]]
+            failed_results = [r for r in self.results if not r["success"]]
+            failed = len(failed_results)
+            
+            # 首次检测到失败时，打印具体的错误信息帮助诊断
+            if failed > 0 and not first_error_logged:
+                first_err = failed_results[0].get("error", "unknown")
+                print(f"[⚠️ First Error] {first_err}")
+                first_error_logged = True
+            
+            # 计算瞬时指标 (例如最近 3 秒内，防止被冷启动或前期指标拉平)
+            now_time = time.time()
+            recent_results = [r for r in self.results if now_time - r.get("timestamp", 0) < 3.0]
+            recent_successful = [r for r in recent_results if r["success"]]
+            
+            avg_latency = np.mean([r["total_latency"] for r in recent_successful]) if recent_successful else 0
+            
+            # 兼容不同协议的吞吐计算
+            if self.test_type == 'LLM':
+                # 累计 TPS (Tokens per Second)
+                total_tokens = sum(r["custom_metrics"].get("tokens", 0) for r in successful)
+                cum_tps = total_tokens / elapsed if elapsed > 0 else 0
+                
+                # 瞬时 TTFT
+                avg_ttft = np.mean([r["custom_metrics"].get("ttft") for r in recent_successful if r["custom_metrics"].get("ttft") is not None]) if recent_successful else 0
+                print(f"[Telemetry] Time: {elapsed:.1f}s | Concurrency: {self.running_workers} | Success: {len(successful)} | Failed: {failed} | Latency: {avg_latency:.1f}ms | TTFT: {avg_ttft:.1f}ms | TPS: {cum_tps:.1f}")
+            else:
+                # 通用 QPS
+                cum_qps = len(successful) / elapsed if elapsed > 0 else 0
+                print(f"[Telemetry] Time: {elapsed:.1f}s | Concurrency: {self.running_workers} | Success: {len(successful)} | Failed: {failed} | Latency: {avg_latency:.1f}ms | QPS: {cum_qps:.1f}")
 
     async def run(self):
         """运行测试任务"""
-        print(f"🚀 Starting LLM Performance Test for model: {self.api_config.get('model')}")
+        print(f"🚀 Starting {self.test_type} Performance Test.")
         self.start_time = time.perf_counter()
-        payload = self.prepare_payload()
+        payload = await self.executor.prepare_payload()
         
         load_mode = self.test_config.get('load_mode', 'constant')
         load_config = self.test_config.get('load_config', {})
@@ -283,8 +224,9 @@ class LLMPerfPlatform:
         else:
             duration = self.test_config.get('duration', 60)
 
-        # 启动自适应负载调度协程
+        # 启动自适应负载调度协程与实时遥测协程
         manager_task = asyncio.create_task(self.adjust_concurrency_loop(load_mode, load_config, payload))
+        telemetry_task = asyncio.create_task(self.report_telemetry_loop())
         
         # 挂起主线程直到测试结束
         await asyncio.sleep(duration)
@@ -292,11 +234,24 @@ class LLMPerfPlatform:
         # 触发停止信号
         self.should_stop = True
         
-        # 强制结束所有仍然活动的任务并收集数据
+        # 优雅等待在途请求完成
+        live_tasks = [t for t in self.active_tasks if not t.done()]
+        if live_tasks:
+            print(f"⏳ Waiting for {len(live_tasks)} in-flight request(s) to finish (max 30s)...")
+            try:
+                await asyncio.wait(live_tasks, timeout=30.0)
+            except Exception:
+                pass
+        
+        # 强制结束所有仍然未完成的任务
+        still_running = [t for t in self.active_tasks if not t.done()]
+        if still_running:
+            print(f"⚠️ Force-cancelling {len(still_running)} task(s) that didn't finish in time.")
         for t in self.active_tasks:
             if not t.done():
                 t.cancel()
         manager_task.cancel()
+        telemetry_task.cancel()
         
         self.total_time = time.perf_counter() - self.start_time
         print(f"🏁 Test completed in {self.total_time:.2f} seconds.")
@@ -306,46 +261,96 @@ class LLMPerfPlatform:
     def analyze_results(self):
         """分析并生成报告数据"""
         successful = [r for r in self.results if r["success"]]
-        ttfts = [r["ttft"] for r in successful if r["ttft"] is not None]
-        itls = [itl for r in successful for itl in r["itls"]]
         latencies = [r["total_latency"] for r in successful]
         
         stats = {
-            "model": self.api_config.get('model'),
-            "concurrency": self.test_config.get('concurrency'),
-            "duration": self.test_config.get('duration'),
             "total_requests": len(self.results),
             "successful": len(successful),
             "failed": len(self.results) - len(successful),
             "qps": round(len(successful) / self.total_time, 2) if self.total_time > 0 else 0,
-            "tps": round(sum(r["tokens"] for r in successful) / self.total_time, 2) if self.total_time > 0 else 0,
-            "avg_ttft": round(np.mean(ttfts), 2) if ttfts else 0,
-            "p95_ttft": round(np.percentile(ttfts, 95), 2) if ttfts else 0,
-            "avg_itl": round(np.mean(itls), 2) if itls else 0,
             "avg_latency": round(np.mean(latencies), 2) if latencies else 0,
             "p95_latency": round(np.percentile(latencies, 95), 2) if latencies else 0,
+            "p99_latency": round(np.percentile(latencies, 99), 2) if latencies else 0,
         }
         
-        # 专家诊断建议
+        # 协议特有的后处理与性能评估
         analysis = []
-        if stats["p95_ttft"] > 1000:
-            analysis.append("⚠️ **High TTFT detected**: P95 TTFT > 1s indicates potential prefill bottlenecks or cold starts.")
-        if stats["avg_itl"] > 100:
-            analysis.append("🐢 **Slow Generation**: Average ITL > 100ms may lead to a laggy reading experience.")
+        
+        if self.test_type == 'LLM':
+            ttfts = [r["custom_metrics"].get("ttft") for r in successful if r["custom_metrics"].get("ttft") is not None]
+            
+            # 计算 TPOT (Time Per Output Token) 作为 ITL 的代理指标
+            tpots = []
+            for r in successful:
+                tokens = r["custom_metrics"].get("tokens", 0)
+                ttft = r["custom_metrics"].get("ttft")
+                if tokens > 1 and ttft is not None:
+                    tpot = (r["total_latency"] - ttft) / (tokens - 1)
+                    tpots.append(tpot)
+                elif tokens == 1 and ttft is not None:
+                    tpots.append(r["total_latency"] - ttft)
+
+            stats.update({
+                "avg_ttft": round(np.mean(ttfts), 2) if ttfts else 0,
+                "p95_ttft": round(np.percentile(ttfts, 95), 2) if ttfts else 0,
+                "p99_ttft": round(np.percentile(ttfts, 99), 2) if ttfts else 0,
+                "avg_itl": round(np.mean(tpots), 2) if tpots else 0,
+                "tps": round(sum(r["custom_metrics"].get("tokens", 0) for r in successful) / self.total_time, 2) if self.total_time > 0 else 0,
+            })
+            
+            if stats["p95_ttft"] > 1000:
+                analysis.append("⚠️ **High TTFT detected**: P95 TTFT > 1s indicates potential prefill bottlenecks or cold starts.")
+            if stats["avg_itl"] > 100:
+                analysis.append("🐢 **Slow Generation**: Average ITL > 100ms may lead to a laggy reading experience.")
+        else:
+            # REST API 特有分析
+            response_sizes = [r["custom_metrics"].get("response_size", 0) for r in successful]
+            avg_response_size = np.mean(response_sizes) if response_sizes else 0
+            
+            # 统计 HTTP 状态码分布
+            status_codes = {}
+            for r in self.results:
+                code = r["custom_metrics"].get("status_code")
+                if code:
+                    status_codes[code] = status_codes.get(code, 0) + 1
+            
+            stats.update({
+                "avg_response_size": round(avg_response_size, 2),
+                "status_codes": json.dumps(status_codes),
+                # 填充默认 LLM 字段防止 TS 解析报错
+                "avg_ttft": 0,
+                "p95_ttft": 0,
+                "p99_ttft": 0,
+                "avg_itl": 0,
+                "tps": 0,
+            })
+            
+            if stats["failed"] > 0:
+                analysis.append(f"❌ **API Error rate is non-zero**: {stats['failed']} requests failed. Verify server capacity.")
+            if stats["p95_latency"] > 500:
+                analysis.append("⚠️ **Slow API response**: P95 Latency > 500ms. Consider checking DB indexes or network bottlenecks.")
+
         if stats["failed"] > 0:
-            analysis.append(f"❌ **Reliability Issue**: {stats['failed']} requests failed. Check rate limits or backend stability.")
+            failed_results = [r for r in self.results if not r["success"] and r.get("error")]
+            unique_errors = list(dict.fromkeys(r["error"] for r in failed_results))[:3]
+            if unique_errors:
+                analysis.append("📋 **Error Samples (前 3 条去重错误):**")
+                for i, err in enumerate(unique_errors, 1):
+                    err_display = err[:300] + "..." if len(err) > 300 else err
+                    analysis.append(f"  {i}. {err_display}")
+            stats["error_samples"] = unique_errors
             
         return {"stats": stats, "analysis": analysis}
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LLM Performance Platform Runner")
+    parser = argparse.ArgumentParser(description="Multi-Protocol Performance Platform Runner")
     parser.add_argument("--config", type=str, required=True, help="Path to config.yaml")
     args = parser.parse_args()
     
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
-    platform = LLMPerfPlatform(config)
+    platform = MultiProtocolPerfPlatform(config)
     report_data = asyncio.run(platform.run())
     
     # 输出结果摘要

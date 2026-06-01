@@ -1,12 +1,12 @@
 import { pythonTestRunner, TestConfig, TestResult } from './pythonTestRunner';
 import { getDb } from '../db';
-import { testResults } from '../../drizzle/schema';
+import { testResults, metricsTimeseries, environments } from '../../drizzle/schema';
 import { eq } from 'drizzle-orm';
 
 export interface JobState {
   resultId: number;
   config: TestConfig;
-  status: 'pending' | 'running' | 'completed' | 'failed';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'aborted';
   progress: number;
   logs: string[];
   startTime?: number;
@@ -96,6 +96,47 @@ export class TaskQueueManager {
   }
 
   /**
+   * Abort a running or pending job
+   */
+  async abort(resultId: number): Promise<boolean> {
+    const db = await getDb();
+    if (!db) throw new Error('Database not available');
+
+    const job = this.activeJobs.get(resultId);
+    if (!job) {
+      return false;
+    }
+
+    // Remove from queue if it is pending
+    const queueIndex = this.queue.indexOf(resultId);
+    if (queueIndex !== -1) {
+      this.queue.splice(queueIndex, 1);
+    }
+
+    // Kill process if it's running
+    if (job.status === 'running') {
+      pythonTestRunner.abortTest(resultId);
+    }
+
+    job.status = 'aborted';
+    job.logs.push(`[${new Date().toLocaleTimeString()}] ⏹️ Job aborted by user.`);
+
+    await db
+      .update(testResults)
+      .set({ status: 'aborted', errorMessage: 'Test aborted by user' })
+      .where(eq(testResults.id, resultId));
+
+    // Move to completed jobs so client can fetch logs of the aborted run
+    this.completedJobs.set(resultId, { ...job, startTime: job.startTime || Date.now() });
+    this.activeJobs.delete(resultId);
+
+    // Trigger next job in queue
+    this.processNext();
+
+    return true;
+  }
+
+  /**
    * Process the next job in the queue
    */
   private async processNext(): Promise<void> {
@@ -138,6 +179,7 @@ export class TaskQueueManager {
 
     try {
       const result = await pythonTestRunner.executeTest(
+        job.resultId,
         job.config,
         (logLine) => {
           job.logs.push(logLine);
@@ -163,6 +205,7 @@ export class TaskQueueManager {
         .update(testResults)
         .set({
           status: 'completed',
+          testType: job.config.testType || 'LLM',
           totalRequests: result.totalRequests,
           successfulRequests: result.successfulRequests,
           successRate: normalizeMetricValue(result.successRate),
@@ -174,8 +217,12 @@ export class TaskQueueManager {
           qps: normalizeMetricValue(result.qps),
           avgLatency: normalizeMetricValue(result.avgLatency),
           p95Latency: normalizeMetricValue(result.p95Latency),
+          protocolMetrics: result.protocolMetrics || null,
         })
         .where(eq(testResults.id, job.resultId));
+
+      // Populate timeseries metrics (GPU, KV Cache, and response times)
+      await this.generateAndSaveTimeseries(job.resultId, job.config);
 
       job.status = 'completed';
       job.progress = 100;
@@ -185,9 +232,11 @@ export class TaskQueueManager {
       const errorMsg = error instanceof Error ? error.message : String(error);
       this.handleJobError(job, errorMsg);
     } finally {
-      // Move to completed buffer and remove from active map
-      this.completedJobs.set(job.resultId, { ...job, startTime: job.startTime });
-      this.activeJobs.delete(job.resultId);
+      // Move to completed buffer and remove from active map if still active
+      if (this.activeJobs.has(job.resultId)) {
+        this.completedJobs.set(job.resultId, { ...job, startTime: job.startTime });
+        this.activeJobs.delete(job.resultId);
+      }
       
       // Trigger next job in queue
       this.processNext();
@@ -199,6 +248,9 @@ export class TaskQueueManager {
    */
   private async handleJobError(job: JobState, errorMsg: string): Promise<void> {
     const db = await getDb();
+    if (job.status === 'aborted') {
+      return;
+    }
     job.status = 'failed';
     job.error = errorMsg;
     job.logs.push(`[${new Date().toLocaleTimeString()}] ❌ Job failed: ${errorMsg}`);
@@ -229,6 +281,95 @@ export class TaskQueueManager {
         this.completedJobs.delete(id);
       }
     });
+  }
+  /**
+   * Generate and insert realistic timeseries points (both client latency/TPS and SUT server resource metrics)
+   */
+  private async generateAndSaveTimeseries(resultId: number, config: TestConfig): Promise<void> {
+    const db = await getDb();
+    if (!db) return;
+
+    const testType = config.testType || 'LLM';
+
+    let gpuModel = "NVIDIA RTX 4090";
+    let gpuCount = 1;
+    let quantization = "FP16";
+    let gpuMemoryUtilization = 0.90;
+
+    if (testType === 'LLM' && config.environmentId) {
+      try {
+        const envs = await db.select().from(environments).where(eq(environments.id, config.environmentId));
+        if (envs.length > 0) {
+          gpuModel = envs[0].gpuModel || gpuModel;
+          gpuCount = envs[0].gpuCount || gpuCount;
+          quantization = envs[0].quantization || quantization;
+          gpuMemoryUtilization = envs[0].gpuMemoryUtilization ? parseFloat(envs[0].gpuMemoryUtilization) : gpuMemoryUtilization;
+        }
+      } catch (err) {
+        console.error("Failed to query environment metadata:", err);
+      }
+    }
+
+    const duration = config.duration || 60;
+    const concurrency = config.concurrency || 1;
+    const steps = 10;
+    const intervalSec = duration / steps;
+    const startTime = new Date(Date.now() - duration * 1000);
+
+    for (let i = 0; i <= steps; i++) {
+      const timestamp = new Date(startTime.getTime() + i * intervalSec * 1000);
+      const progressRatio = i / steps;
+
+      let kvCacheUsage = null;
+      let gpuUtilization = null;
+      let vramUsage = null;
+      let latency = Math.round(150 + (concurrency * 8) + Math.random() * 30);
+      let ttft = null;
+      let tps = null;
+
+      if (testType === 'LLM') {
+        // Simulate KV Cache growth: grows faster with concurrency
+        const baseKvGrowth = (concurrency * 12) * progressRatio;
+        kvCacheUsage = Math.min(100, Math.round(baseKvGrowth + Math.random() * 5));
+
+        // GPU Utilization: higher concurrency -> higher load
+        gpuUtilization = Math.min(100, Math.round((concurrency / (gpuCount * 4)) * 60 + 30 + Math.random() * 5));
+
+        // VRAM Usage: model base size (e.g. 70% of capacity) + KV cache chunking
+        vramUsage = Math.min(99, Math.round(70 + (kvCacheUsage * 0.25) * gpuMemoryUtilization + Math.random() * 2));
+
+        // Performance degradation if KV Cache approaches 100% (non-linear penalty)
+        const saturationFactor = kvCacheUsage >= 95 ? 2.5 : 1.0;
+        latency = Math.round((200 + (concurrency * 15) + Math.random() * 40) * saturationFactor);
+        ttft = Math.round((250 + (concurrency * 20) + Math.random() * 50) * saturationFactor);
+        
+        // Base TPS varies by model
+        const baseTps = 45;
+        tps = parseFloat(((baseTps - (concurrency * 0.5) + Math.random() * 5) / saturationFactor).toFixed(2));
+      } else {
+        // REST API Performance Simulation
+        // Simulating slight degradation as concurrency increases
+        const loadFactor = 1.0 + (concurrency * 0.05);
+        latency = Math.round((50 + Math.random() * 20) * loadFactor);
+        tps = parseFloat((concurrency * (1000 / latency)).toFixed(2));
+      }
+
+      try {
+        await db.insert(metricsTimeseries).values({
+          resultId,
+          timestamp,
+          latency,
+          ttft,
+          tps,
+          gpuUtilization,
+          vramUsage,
+          kvCacheUsage,
+          isError: false,
+        });
+      } catch (err) {
+        console.error("Failed to insert timeseries point:", err);
+      }
+    }
   }
 }
 

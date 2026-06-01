@@ -1,4 +1,4 @@
-import { int, json, mysqlEnum, mysqlTable, text, timestamp, varchar, double, boolean, decimal } from "drizzle-orm/mysql-core";
+import { int, json, mysqlEnum, mysqlTable, text, mediumtext, timestamp, varchar, double, boolean, decimal } from "drizzle-orm/mysql-core";
 
 export const users = mysqlTable("users", {
   id: int("id").autoincrement().primaryKey(),
@@ -15,20 +15,42 @@ export const users = mysqlTable("users", {
 export type User = typeof users.$inferSelect;
 export type InsertUser = typeof users.$inferInsert;
 
+export const environments = mysqlTable("environments", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId").notNull(),
+  name: varchar("name", { length: 255 }).notNull(),
+  gpuModel: varchar("gpuModel", { length: 128 }),
+  gpuCount: int("gpuCount"),
+  inferenceEngine: varchar("inferenceEngine", { length: 128 }),
+  engineVersion: varchar("engineVersion", { length: 128 }),
+  quantization: varchar("quantization", { length: 64 }),
+  maxModelLen: int("maxModelLen"),
+  gpuMemoryUtilization: decimal("gpuMemoryUtilization", { precision: 4, scale: 2 }),
+  prometheusUrl: text("prometheusUrl"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export type Environment = typeof environments.$inferSelect;
+export type InsertEnvironment = typeof environments.$inferInsert;
+
 export const testConfigs = mysqlTable("test_configs", {
   id: int("id").autoincrement().primaryKey(),
   userId: int("userId").notNull(),
   name: varchar("name", { length: 255 }).notNull(),
-  apiProvider: varchar("apiProvider", { length: 64 }).notNull(),
-  apiUrl: text("apiUrl").notNull(),
-  model: varchar("model", { length: 255 }).notNull(),
+  testType: varchar("testType", { length: 32 }).default("LLM").notNull(),
+  apiProvider: varchar("apiProvider", { length: 64 }),
+  apiUrl: text("apiUrl"),
+  model: varchar("model", { length: 255 }),
   concurrency: int("concurrency").notNull(),
   duration: int("duration").notNull(),
   loadMode: varchar("loadMode", { length: 64 }).notNull(),
   loadConfig: json("loadConfig"),
-  inputType: varchar("inputType", { length: 64 }).notNull(),
-  inputData: text("inputData"),
+  inputType: varchar("inputType", { length: 64 }),
+  inputData: mediumtext("inputData"),
+  protocolConfig: json("protocolConfig"),
   datasetId: int("datasetId"), // 新增 dataset 关联
+  environmentId: int("environmentId"), // 新增被测环境关联
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 });
@@ -72,6 +94,7 @@ export const testResults = mysqlTable("test_results", {
   userId: int("userId").notNull(),
   configId: int("configId").notNull(),
   name: varchar("name", { length: 255 }),
+  testType: varchar("testType", { length: 32 }).default("LLM").notNull(),
   model: varchar("model", { length: 255 }),
   concurrency: int("concurrency"),
   duration: int("duration"),
@@ -89,10 +112,12 @@ export const testResults = mysqlTable("test_results", {
   qps: decimal("qps", { precision: 10, scale: 2 }),
   avgLatency: decimal("avgLatency", { precision: 10, scale: 2 }),
   p95Latency: decimal("p95Latency", { precision: 10, scale: 2 }),
+  protocolMetrics: json("protocolMetrics"),
   
   reportUrl: text("reportUrl"),
   errorMessage: text("errorMessage"),
   keysUsed: int("keysUsed"), 
+  environmentId: int("environmentId"), // 新增被测环境关联
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 });
@@ -112,6 +137,9 @@ export const metricsTimeseries = mysqlTable("metrics_timeseries", {
   
   isError: boolean("isError").default(false).notNull(),
   errorCode: varchar("errorCode", { length: 128 }),
+  gpuUtilization: double("gpuUtilization"),
+  vramUsage: double("vramUsage"),
+  kvCacheUsage: double("kvCacheUsage"),
 });
 
 export type MetricsTimeserie = typeof metricsTimeseries.$inferSelect;

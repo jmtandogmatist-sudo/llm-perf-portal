@@ -200,7 +200,7 @@
   }
 
   .button-secondary {
-    @apply inline-flex items-center justify-center px-6 py-3 rounded-lg font-semibold bg-secondary/10 text-secondary hover:bg-secondary/20 active:scale-95 transition-all duration-200;
+    @apply inline-flex items-center justify-center px-6 py-3 rounded-lg font-semibold bg-secondary text-secondary-foreground hover:bg-secondary/80 active:scale-95 transition-all duration-200;
   }
 
   .button-outline {

@@ -9,16 +9,20 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 export interface TestConfig {
-  apiProvider: string;
-  apiUrl: string;
-  apiKey: string;
-  model: string;
+  apiProvider?: string;
+  apiUrl?: string;
+  apiKey?: string;
+  model?: string;
   concurrency: number;
   duration: number;
   loadMode: string;
   loadConfig: Record<string, any>;
-  inputType: string;
-  inputData: string;
+  inputType?: string;
+  inputData?: string;
+  environmentId?: number;
+  // 新增多协议字段
+  testType?: string;
+  protocolConfig?: Record<string, any>;
 }
 
 export interface TestResult {
@@ -34,6 +38,7 @@ export interface TestResult {
   avgLatency: number;
   p95Latency: number;
   analysis: string[];
+  protocolMetrics?: Record<string, any>;
 }
 
 /**
@@ -42,6 +47,7 @@ export interface TestResult {
  */
 export class PythonTestRunner {
   private tempDir = join('/tmp', 'llm-perf-tests');
+  private activeProcesses = new Map<number, any>();
 
   constructor() {
     try {
@@ -52,10 +58,23 @@ export class PythonTestRunner {
   }
 
   /**
+   * 中止正在运行的测试
+   */
+  abortTest(resultId: number): boolean {
+    const process = this.activeProcesses.get(resultId);
+    if (process) {
+      process.kill('SIGINT');
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * 执行真实的性能测试
    * 支持流式日志回调
    */
   async executeTest(
+    resultId: number,
     config: TestConfig,
     onProgress?: (log: string) => void,
     onError?: (error: string) => void
@@ -72,12 +91,13 @@ export class PythonTestRunner {
       onProgress?.(`[${new Date().toLocaleTimeString()}] 📝 Config path: ${configPath}`);
 
       // 执行 Python 脚本
-      return await this.runPythonScript(configPath, onProgress, onError);
+      return await this.runPythonScript(resultId, configPath, onProgress, onError);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
       onError?.(errorMsg);
       throw new Error(`Test execution failed: ${errorMsg}`);
     } finally {
+      this.activeProcesses.delete(resultId);
       // 清理临时文件
       try {
         unlinkSync(configPath);
@@ -91,28 +111,41 @@ export class PythonTestRunner {
    * 生成 YAML 配置文件
    */
   private generateYamlConfig(config: TestConfig): string {
-    const yamlObj = {
-      api: {
-        url: config.apiUrl,
-        key: config.apiKey,
-        model: config.model,
-        provider: config.apiProvider,
-      },
+    const testType = config.testType || 'LLM';
+    
+    const yamlObj: any = {
+      test_type: testType,
       test: {
         concurrency: config.concurrency,
         duration: config.duration,
-        stream: true,
         load_mode: config.loadMode,
         load_config: config.loadConfig,
-        input: {
-          type: config.inputType,
-          data: config.inputData,
-        },
       },
       report: {
         output_format: 'json',
       },
     };
+
+    if (testType === 'REST_API') {
+      yamlObj.protocol_config = config.protocolConfig || {};
+    } else {
+      yamlObj.test.stream = true;
+      if (config.protocolConfig) {
+        yamlObj.protocol_config = config.protocolConfig;
+      } else {
+        // 兼容老调用逻辑，旧版本接口字段进行转换
+        yamlObj.api = {
+          url: config.apiUrl || '',
+          key: config.apiKey || '',
+          model: config.model || '',
+          provider: config.apiProvider || '',
+        };
+        yamlObj.test.input = {
+          type: config.inputType || 'text',
+          data: config.inputData || '',
+        };
+      }
+    }
 
     return yaml.stringify(yamlObj);
   }
@@ -121,6 +154,7 @@ export class PythonTestRunner {
    * 运行 Python 脚本并流式传输日志
    */
   private runPythonScript(
+    resultId: number,
     configPath: string,
     onProgress?: (log: string) => void,
     onError?: (error: string) => void
@@ -135,6 +169,8 @@ export class PythonTestRunner {
         cwd: __dirname,
         timeout: 600000, // 10 分钟超时
       });
+
+      this.activeProcesses.set(resultId, pythonProcess);
 
       let stdout = '';
       let stderr = '';
@@ -252,19 +288,33 @@ export class PythonTestRunner {
     const successful = parseInt(stats['successful'] || '0');
     const successRate = totalRequests > 0 ? ((successful / totalRequests) * 100).toFixed(1) : '0';
 
+    // 尝试解析 REST API 特有指标
+    let protocolMetrics: Record<string, any> | undefined;
+    if (stats['status_codes']) {
+      try {
+        protocolMetrics = {
+          statusCodes: JSON.parse(stats['status_codes']),
+          avgResponseSize: parseFloat(stats['avg_response_size'] || '0')
+        };
+      } catch (e) {
+        console.error('Failed to parse status_codes from python output:', e);
+      }
+    }
+
     return {
       totalRequests,
       successfulRequests: successful,
       successRate: parseFloat(successRate as any) || 0,
       ttftAvg: Math.round(parseFloat(stats['avg_ttft'] || '0')),
       ttftP95: Math.round(parseFloat(stats['p95_ttft'] || '0')),
-      ttftP99: Math.round(parseFloat(stats['p95_ttft'] || '0') * 1.1), // P99 通常比 P95 略高
-        tpsAvg: parseFloat((parseFloat(stats['tps'] || '0')).toFixed(2)),
+      ttftP99: Math.round(parseFloat(stats['p99_ttft'] || '0')), // 使用 Python 端直接计算的真实 P99 分位数
+      tpsAvg: parseFloat((parseFloat(stats['tps'] || '0')).toFixed(2)),
       itlAvg: Math.round(parseFloat(stats['avg_itl'] || '0')),
       qps: parseFloat((parseFloat(stats['qps'] || '0')).toFixed(2)),
-        avgLatency: Math.round(parseFloat(stats['avg_latency'] || '0')),
-        p95Latency: Math.round(parseFloat(stats['p95_latency'] || '0')),
+      avgLatency: Math.round(parseFloat(stats['avg_latency'] || '0')),
+      p95Latency: Math.round(parseFloat(stats['p95_latency'] || '0')),
       analysis,
+      protocolMetrics
     };
   }
 }

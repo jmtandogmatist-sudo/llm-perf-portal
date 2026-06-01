@@ -87,7 +87,9 @@ class LLMPerfTesterV2:
     """
     def __init__(self, api_url: str, api_key: str, model: str, payload_template: dict, concurrency: int, duration: int, stream: bool = True):
         self.api_url = api_url
-        self.api_key = api_key
+        self.api_key = api_key.strip()
+        if self.api_key.startswith("Bearer "):
+            self.api_key = self.api_key[7:].strip()
         self.model = model
         self.payload = payload_template
         self.concurrency = concurrency

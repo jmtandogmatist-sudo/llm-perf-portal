@@ -1,13 +1,29 @@
-import "dotenv/config";
+import "dotenv/config"; // trigger restart
 import express from "express";
 import { createServer } from "http";
 import net from "net";
+import os from "os";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerOAuthRoutes } from "./oauth";
 import { registerStorageProxy } from "./storageProxy";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
+
+function getLocalIpAddress(): string {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    const netInterface = interfaces[name];
+    if (netInterface) {
+      for (const netInfo of netInterface) {
+        if (netInfo.family === "IPv4" && !netInfo.internal) {
+          return netInfo.address;
+        }
+      }
+    }
+  }
+  return "localhost";
+}
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -34,6 +50,10 @@ async function startServer() {
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
+  
+  // Serve uploaded files statically
+  app.use("/uploads", express.static("/tmp/llm-perf-tests/uploads"));
+
   registerStorageProxy(app);
   registerOAuthRoutes(app);
   // tRPC API
@@ -59,9 +79,12 @@ async function startServer() {
   }
 
   server.listen(port, "0.0.0.0", () => {
-    const ipAddress = process.env.HOST_IP || "0.0.0.0";
-    console.log(`Server running on http://${ipAddress}:${port}/`);
+    const localIp = getLocalIpAddress();
+    console.log(`\n==================================================`);
+    console.log(`⚡ LLM Perf Portal is now shared on your local network!`);
+    console.log(`Colleagues can access it at: http://${localIp}:${port}/`);
     console.log(`Local access: http://localhost:${port}/`);
+    console.log(`==================================================\n`);
   });
 }
 
