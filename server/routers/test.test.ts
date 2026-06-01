@@ -512,4 +512,49 @@ describe('Test Router - 参数验证与边界测试', () => {
       expect(result).toEqual({ configId: 1, success: true });
     });
   });
+
+  // ────────────────────────────────────────────────────────
+  // 分组 6：getResult - 查询详情
+  // ────────────────────────────────────────────────────────
+  describe('getResult - 查询特定测试运行详情及其关联的配置和环境', () => {
+    it('正常访问已存在的测试运行应返回详情、配置和环境', async () => {
+      const { getDb } = await import('../db');
+      const mockDb = await getDb() as any;
+
+      const mockResult = { id: 1, userId: 1, configId: 10, environmentId: 20, testType: 'LLM', model: 'gpt-4o' };
+      const mockConfig = { id: 10, userId: 1, name: 'Snapshot Config', apiProvider: 'openai', apiUrl: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4o' };
+      const mockEnv = { id: 20, userId: 1, name: 'SUT-Prod-1' };
+
+      let callCount = 0;
+      mockDb.select.mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) return buildSelectChainMock([mockResult]);
+        if (callCount === 2) return buildSelectChainMock([mockConfig]);
+        if (callCount === 3) return buildSelectChainMock([mockEnv]);
+        return buildSelectChainMock([]);
+      });
+
+      const caller = testRouter.createCaller(createMockContext());
+      const res = await caller.getResult({ resultId: 1 });
+
+      expect(res).toEqual({
+        ...mockResult,
+        config: mockConfig,
+        environment: mockEnv,
+      });
+      expect(mockDb.select).toHaveBeenCalledTimes(3);
+    });
+
+    it('如果测试运行不存在应返回 null', async () => {
+      const { getDb } = await import('../db');
+      const mockDb = await getDb() as any;
+      
+      mockDb.select.mockImplementation(() => buildSelectChainMock([]));
+
+      const caller = testRouter.createCaller(createMockContext());
+      const res = await caller.getResult({ resultId: 999 });
+
+      expect(res).toBeNull();
+    });
+  });
 });

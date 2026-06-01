@@ -46,6 +46,10 @@ export default function Generator() {
   // 路由导航钩子
   const [, navigate] = useLocation();
 
+  // 解析 URL 中的克隆配置 ID 参数 (cloneId)
+  const cloneIdStr = typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("cloneId") : null;
+  const cloneId = cloneIdStr ? Number(cloneIdStr) : null;
+
   // ── UI 状态 ──────────────────────────────────────────────
   /** 复制配置按钮的"已复制"短暂状态 */
   const [copied, setCopied] = useState(false);
@@ -203,6 +207,12 @@ export default function Generator() {
   /** API 健康检查 Mutation（在正式测试前做连通性预检） */
   const checkApiHealthMutation = trpc.test.checkApiHealth.useMutation();
 
+  /** 查询用于克隆的测试历史记录配置 */
+  const { data: cloneData } = trpc.test.getResult.useQuery(
+    { resultId: cloneId ?? 0 },
+    { enabled: !!cloneId }
+  );
+
   /** tRPC Utils，用于手动触发 Query 缓存失效/重新请求 */
   const utils = trpc.useUtils();
 
@@ -217,6 +227,88 @@ export default function Generator() {
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
+
+  /**
+   * 自动克隆配置逻辑
+   * 当从 Dashboard 中选择“克隆此配置”跳转来时，根据 cloneData 自动填充表单配置
+   */
+  useEffect(() => {
+    if (!cloneData) return;
+
+    const configData = cloneData.config;
+    if (!configData) {
+      toast.error("未找到对应的测试配置快照，无法克隆");
+      return;
+    }
+
+    // 设置测试类型和被测环境
+    const clonedTestType = cloneData.testType as "LLM" | "REST_API";
+    setTestType(clonedTestType);
+    setSelectedEnvId(cloneData.environmentId || undefined);
+
+    if (clonedTestType === "LLM") {
+      setConfig({
+        apiProvider: configData.apiProvider || "openai",
+        apiUrl: configData.apiUrl || "",
+        apiKey: "", // 出于安全性考虑，API Key 重置为空，让用户输入
+        model: configData.model || "",
+        loadMode: configData.loadMode || "constant",
+        loadConfig: configData.loadConfig || { concurrency: 60, duration: 60 },
+        inputType: configData.inputType || "text",
+        inputData: configData.inputData || "",
+      });
+      toast.success(`已成功克隆 LLM 压测配置（模型: ${configData.model}），请检查并输入 API Key 后执行测试`);
+    } else if (clonedTestType === "REST_API") {
+      const protocol = configData.protocolConfig as any;
+      if (protocol) {
+        setRestConfig({
+          url: protocol.url || "https://httpbin.org/post",
+          method: protocol.method || "POST",
+          bodyType: protocol.bodyType || "json",
+          bodyContent: protocol.bodyContent || "",
+          expectedStatus: protocol.expectedStatus !== undefined ? protocol.expectedStatus : 200,
+        });
+
+        // 映射 Headers
+        if (protocol.headers) {
+          const headersArray = Object.entries(protocol.headers).map(([key, value]) => ({
+            key,
+            value: String(value),
+          }));
+          setRestHeaders(headersArray.length > 0 ? headersArray : [{ key: "Content-Type", value: "application/json" }]);
+        } else {
+          setRestHeaders([{ key: "Content-Type", value: "application/json" }]);
+        }
+
+        // 映射 Query Params
+        if (protocol.queryParams) {
+          const paramsArray = Object.entries(protocol.queryParams).map(([key, value]) => ({
+            key,
+            value: String(value),
+          }));
+          setRestQueryParams(paramsArray.length > 0 ? paramsArray : [{ key: "", value: "" }]);
+        } else {
+          setRestQueryParams([{ key: "", value: "" }]);
+        }
+      }
+
+      // 填充负载设置
+      setConfig(prev => ({
+        ...prev,
+        loadMode: configData.loadMode || "constant",
+        loadConfig: configData.loadConfig || { concurrency: 60, duration: 60 },
+      }));
+
+      toast.success(`已成功克隆 REST API 压测配置（接口: ${protocol?.url || ''}），可直接执行测试`);
+    }
+
+    // 清空 URL 中的 cloneId 参数，避免页面刷新时重新覆盖用户修改
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("cloneId");
+      window.history.replaceState({}, "", url.pathname + url.search);
+    }
+  }, [cloneData]);
 
   // ──────────────────────────────────────────────────────────
   // 辅助函数
